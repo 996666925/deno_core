@@ -322,11 +322,6 @@ fn v8_init(
   predictable: bool,
   expose_natives: bool,
 ) {
-  // Include 10MB ICU data file.
-  #[repr(C, align(16))]
-  struct IcuData([u8; 10631872]);
-  static ICU_DATA: IcuData = IcuData(*include_bytes!("icudtl.dat"));
-  v8::icu::set_common_data_73(&ICU_DATA.0).unwrap();
 
   let base_flags = concat!(
     " --wasm-test-streaming",

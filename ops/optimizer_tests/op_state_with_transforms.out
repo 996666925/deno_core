@@ -79,10 +79,9 @@ where
                     }
                 }
                 Err(_) => {
-                    if let Ok(view)
-                        = deno_core::v8::Local::<
-                            deno_core::v8::ArrayBufferView,
-                        >::try_from(value) {
+                    if let Ok(view) = deno_core::v8::Local::<
+                        deno_core::v8::ArrayBufferView,
+                    >::try_from(value) {
                         let len = view.byte_length();
                         let offset = view.byte_offset();
                         let buffer = match view.buffer(scope) {
@@ -111,7 +110,10 @@ where
                 }
             }
         };
-        let result = Self::call(&mut std::cell::RefCell::borrow_mut(&ctx.state), arg_0);
+        let result = Self::call(
+            &mut ::std::cell::RefCell::borrow_mut(&ctx.state),
+            arg_0,
+        );
         let op_state = ::std::cell::RefCell::borrow(&*ctx.state);
         op_state.tracker.track_sync(ctx.id);
     }

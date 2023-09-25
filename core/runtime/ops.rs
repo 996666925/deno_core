@@ -9,6 +9,7 @@ use futures::future::FutureExt;
 use futures::task::noop_waker_ref;
 use serde::Deserialize;
 use serde_v8::from_v8;
+use serde_v8::V8Sliceable;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -269,6 +270,14 @@ macro_rules! try_bignum {
   };
 }
 
+pub fn opstate_borrow<T: 'static>(state: &OpState) -> &T {
+  state.borrow()
+}
+
+pub fn opstate_borrow_mut<T: 'static>(state: &mut OpState) -> &mut T {
+  state.borrow_mut()
+}
+
 pub fn to_u32_option(number: &v8::Value) -> Option<i32> {
   try_number_some!(number Integer is_uint32);
   try_number_some!(number Int32 is_int32);
@@ -318,6 +327,8 @@ pub fn to_external_option(external: &v8::Value) -> Option<*mut c_void> {
     // SAFETY: We know this is an external
     let external: &v8::External = unsafe { std::mem::transmute(external) };
     Some(external.value())
+  } else if external.is_null() {
+    Some(0 as _)
   } else {
     None
   }
@@ -524,25 +535,26 @@ pub fn serde_v8_to_rust<'a, T: Deserialize<'a>>(
 pub fn to_v8_slice<'a, T>(
   scope: &mut v8::HandleScope,
   input: v8::Local<'a, v8::Value>,
-) -> Result<serde_v8::V8Slice, &'static str>
+) -> Result<serde_v8::V8Slice<T>, &'static str>
 where
-  v8::Local<'a, T>: TryFrom<v8::Local<'a, v8::Value>>,
-  v8::Local<'a, v8::ArrayBufferView>: From<v8::Local<'a, T>>,
+  T: V8Sliceable,
+  v8::Local<'a, T::V8>: TryFrom<v8::Local<'a, v8::Value>>,
+  v8::Local<'a, v8::ArrayBufferView>: From<v8::Local<'a, T::V8>>,
 {
-  let (store, offset, length) = if let Ok(buf) = v8::Local::<T>::try_from(input)
-  {
-    let buf: v8::Local<v8::ArrayBufferView> = buf.into();
-    let Some(buffer) = buf.buffer(scope) else {
+  let (store, offset, length) =
+    if let Ok(buf) = v8::Local::<T::V8>::try_from(input) {
+      let buf: v8::Local<v8::ArrayBufferView> = buf.into();
+      let Some(buffer) = buf.buffer(scope) else {
       return Err("buffer missing");
     };
-    (
-      buffer.get_backing_store(),
-      buf.byte_offset(),
-      buf.byte_length(),
-    )
-  } else {
-    return Err("expected typed ArrayBufferView");
-  };
+      (
+        buffer.get_backing_store(),
+        buf.byte_offset(),
+        buf.byte_length(),
+      )
+    } else {
+      return Err("expected typed ArrayBufferView");
+    };
   let slice =
     unsafe { serde_v8::V8Slice::from_parts(store, offset..(offset + length)) };
   Ok(slice)
@@ -552,30 +564,31 @@ where
 pub fn to_v8_slice_detachable<'a, T>(
   scope: &mut v8::HandleScope,
   input: v8::Local<'a, v8::Value>,
-) -> Result<serde_v8::V8Slice, &'static str>
+) -> Result<serde_v8::V8Slice<T>, &'static str>
 where
-  v8::Local<'a, T>: TryFrom<v8::Local<'a, v8::Value>>,
-  v8::Local<'a, v8::ArrayBufferView>: From<v8::Local<'a, T>>,
+  T: V8Sliceable,
+  v8::Local<'a, T::V8>: TryFrom<v8::Local<'a, v8::Value>>,
+  v8::Local<'a, v8::ArrayBufferView>: From<v8::Local<'a, T::V8>>,
 {
-  let (store, offset, length) = if let Ok(buf) = v8::Local::<T>::try_from(input)
-  {
-    let buf: v8::Local<v8::ArrayBufferView> = buf.into();
-    let Some(buffer) = buf.buffer(scope) else {
+  let (store, offset, length) =
+    if let Ok(buf) = v8::Local::<T::V8>::try_from(input) {
+      let buf: v8::Local<v8::ArrayBufferView> = buf.into();
+      let Some(buffer) = buf.buffer(scope) else {
       return Err("buffer missing");
     };
-    let res = (
-      buffer.get_backing_store(),
-      buf.byte_offset(),
-      buf.byte_length(),
-    );
-    if !buffer.is_detachable() {
-      return Err("invalid type; expected: detachable");
-    }
-    buffer.detach(None);
-    res
-  } else {
-    return Err("expected typed ArrayBufferView");
-  };
+      let res = (
+        buffer.get_backing_store(),
+        buf.byte_offset(),
+        buf.byte_length(),
+      );
+      if !buffer.is_detachable() {
+        return Err("invalid type; expected: detachable");
+      }
+      buffer.detach(None);
+      res
+    } else {
+      return Err("expected typed ArrayBufferView");
+    };
   let slice =
     unsafe { serde_v8::V8Slice::from_parts(store, offset..(offset + length)) };
   Ok(slice)
@@ -586,6 +599,7 @@ mod tests {
   use crate::error::generic_error;
   use crate::error::AnyError;
   use crate::error::JsError;
+  use crate::runtime::JsRuntimeState;
   use crate::FastString;
   use crate::JsRuntime;
   use crate::OpState;
@@ -623,6 +637,7 @@ mod tests {
       op_test_float,
       op_test_float_result,
       op_test_bigint_i64,
+      op_test_bigint_i64_as_number,
       op_test_bigint_u64,
       op_test_string_owned,
       op_test_string_ref,
@@ -643,17 +658,22 @@ mod tests {
       op_test_v8_type_handle_scope_result,
       op_test_v8_global,
       op_test_serde_v8,
+      op_jsruntimestate,
+      op_jsruntimestate_mut,
       op_state_rc,
       op_state_ref,
       op_state_mut,
       op_state_mut_attr,
       op_state_multi_attr,
       op_buffer_slice,
+      op_buffer_slice_32,
       op_buffer_slice_unsafe_callback,
       op_buffer_copy,
       op_buffer_bytesmut,
       op_external_make,
       op_external_process,
+      op_external_make_null,
+      op_external_process_null,
 
       op_async_void,
       op_async_number,
@@ -1039,12 +1059,28 @@ mod tests {
     input
   }
 
+  #[op2(core, fast)]
+  #[number]
+  pub fn op_test_bigint_i64_as_number(#[number] input: i64) -> i64 {
+    input
+  }
+
   #[tokio::test]
   pub async fn test_op_64() -> Result<(), Box<dyn std::error::Error>> {
     run_test2(
       10,
       "op_test_bigint_i64",
       &format!("assert(op_test_bigint_i64({}n) == {}n)", i64::MAX, i64::MAX),
+    )?;
+    run_test2(
+      10000,
+      "op_test_bigint_i64_as_number",
+      "assert(op_test_bigint_i64_as_number(Number.MAX_SAFE_INTEGER) == Number.MAX_SAFE_INTEGER)",
+    )?;
+    run_test2(
+      10000,
+      "op_test_bigint_i64_as_number",
+      "assert(op_test_bigint_i64_as_number(Number.MIN_SAFE_INTEGER) == Number.MIN_SAFE_INTEGER)",
     )?;
     run_test2(
       10,
@@ -1396,6 +1432,19 @@ mod tests {
   }
 
   #[op2(core, fast)]
+  pub fn op_jsruntimestate(_state: &JsRuntimeState) {}
+
+  #[op2(core, fast)]
+  pub fn op_jsruntimestate_mut(_state: &mut JsRuntimeState) {}
+
+  #[tokio::test]
+  pub async fn test_jsruntimestate() -> Result<(), Box<dyn std::error::Error>> {
+    run_test2(10000, "op_jsruntimestate", "op_jsruntimestate()")?;
+    run_test2(10000, "op_jsruntimestate_mut", "op_jsruntimestate_mut()")?;
+    Ok(())
+  }
+
+  #[op2(core, fast)]
   pub fn op_state_rc(state: Rc<RefCell<OpState>>, value: u32) -> u32 {
     let old_value: u32 = state.borrow_mut().take();
     state.borrow_mut().put(value);
@@ -1455,63 +1504,97 @@ mod tests {
   #[op2(core, fast)]
   pub fn op_buffer_slice(
     #[buffer] input: &[u8],
-    #[bigint] inlen: usize,
+    #[number] inlen: usize,
     #[buffer] output: &mut [u8],
-    #[bigint] outlen: usize,
+    #[number] outlen: usize,
   ) {
     assert_eq!(inlen, input.len());
     assert_eq!(outlen, output.len());
-    output[0] = input[0];
+    if inlen > 0 && outlen > 0 {
+      output[0] = input[0];
+    }
+  }
+
+  #[op2(core, fast)]
+  pub fn op_buffer_slice_32(
+    #[buffer] input: &[u32],
+    #[number] inlen: usize,
+    #[buffer] output: &mut [u32],
+    #[number] outlen: usize,
+  ) {
+    assert_eq!(inlen, input.len());
+    assert_eq!(outlen, output.len());
+    if inlen > 0 && outlen > 0 {
+      output[0] = input[0];
+    }
   }
 
   #[tokio::test]
   pub async fn test_op_buffer_slice() -> Result<(), Box<dyn std::error::Error>>
   {
-    // Uint8Array -> Uint8Array
-    run_test2(
-      10000,
-      "op_buffer_slice",
-      r"
-      let out = new Uint8Array(10);
-      op_buffer_slice(new Uint8Array([1,2,3]), 3, out, 10);
-      assert(out[0] == 1);",
-    )?;
-    // Uint8Array(ArrayBuffer) -> Uint8Array(ArrayBuffer)
-    run_test2(
-      10000,
-      "op_buffer_slice",
-      r"
-      let inbuf = new ArrayBuffer(10);
-      let in_u8 = new Uint8Array(inbuf);
-      in_u8[0] = 1;
-      let out = new ArrayBuffer(10);
-      op_buffer_slice(in_u8, 10, new Uint8Array(out), 10);
-      assert(new Uint8Array(out)[0] == 1);",
-    )?;
-    // Uint8Array(ArrayBuffer, 5, 5) -> Uint8Array(ArrayBuffer)
-    run_test2(
-      10000,
-      "op_buffer_slice",
-      r"
-      let inbuf = new ArrayBuffer(10);
-      let in_u8 = new Uint8Array(inbuf);
-      in_u8[5] = 1;
-      let out = new ArrayBuffer(10);
-      op_buffer_slice(new Uint8Array(inbuf, 5, 5), 5, new Uint8Array(out), 10);
-      assert(new Uint8Array(out)[0] == 1);",
-    )?;
-    // Resizable
-    run_test2(
-      10000,
-      "op_buffer_slice",
-      r"
-      let inbuf = new ArrayBuffer(10, { maxByteLength: 100 });
-      let in_u8 = new Uint8Array(inbuf);
-      in_u8[5] = 1;
-      let out = new ArrayBuffer(10, { maxByteLength: 100 });
-      op_buffer_slice(new Uint8Array(inbuf, 5, 5), 5, new Uint8Array(out), 10);
-      assert(new Uint8Array(out)[0] == 1);",
-    )?;
+    for (op, arr, size) in [
+      ("op_buffer_slice", "Uint8Array", 1),
+      ("op_buffer_slice_32", "Uint32Array", 4),
+    ] {
+      run_test2(
+        10000,
+        op,
+        &format!("{op}(new {arr}(0), 0, new {arr}(0), 0);"),
+      )?;
+      // UintXArray -> UintXArray
+      run_test2(
+        10000,
+        op,
+        &format!(
+          r"
+        let out = new {arr}(10);
+        {op}(new {arr}([1,2,3]), 3, out, 10);
+        assert(out[0] == 1);"
+        ),
+      )?;
+      // UintXArray(ArrayBuffer) -> UintXArray(ArrayBuffer)
+      run_test2(
+        10000,
+        op,
+        &format!(
+          r"
+        let inbuf = new ArrayBuffer(10 * {size});
+        let in_u8 = new {arr}(inbuf);
+        in_u8[0] = 1;
+        let out = new ArrayBuffer(10 * {size});
+        {op}(in_u8, 10, new {arr}(out), 10);
+        assert(new {arr}(out)[0] == 1);"
+        ),
+      )?;
+      // UintXArray(ArrayBuffer, 5, 5) -> UintXArray(ArrayBuffer)
+      run_test2(
+        10000,
+        op,
+        &format!(
+          r"
+        let inbuf = new ArrayBuffer(10 * {size});
+        let in_u8 = new {arr}(inbuf);
+        in_u8[5] = 1;
+        let out = new ArrayBuffer(10 * {size});
+        {op}(new {arr}(inbuf, 5 * {size}, 5), 5, new {arr}(out), 10);
+        assert(new {arr}(out)[0] == 1);"
+        ),
+      )?;
+      // Resizable
+      run_test2(
+        10000,
+        op,
+        &format!(
+          r"
+        let inbuf = new ArrayBuffer(10 * {size}, {{ maxByteLength: 100 * {size} }});
+        let in_u8 = new {arr}(inbuf);
+        in_u8[5] = 1;
+        let out = new ArrayBuffer(10 * {size}, {{ maxByteLength: 100 * {size} }});
+        {op}(new {arr}(inbuf, 5 * {size}, 5), 5, new {arr}(out), 10);
+        assert(new {arr}(out)[0] == 1);"
+        ),
+      )?;
+    }
     Ok(())
   }
 
@@ -1619,6 +1702,29 @@ mod tests {
       10000,
       "op_external_make, op_external_process",
       "op_external_process(op_external_make())",
+    )?;
+    Ok(())
+  }
+
+  #[op2(core, fast)]
+  fn op_external_make_null() -> *const std::ffi::c_void {
+    0 as _
+  }
+
+  #[op2(core, fast)]
+  fn op_external_process_null(
+    input: *const std::ffi::c_void,
+  ) -> *const std::ffi::c_void {
+    assert_eq!(input, 0 as _);
+    input
+  }
+
+  #[tokio::test]
+  pub async fn test_external_null() -> Result<(), Box<dyn std::error::Error>> {
+    run_test2(
+      10000,
+      "op_external_make_null, op_external_process_null",
+      "assert(op_external_process_null(op_external_make_null()) === null)",
     )?;
     Ok(())
   }

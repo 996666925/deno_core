@@ -74,6 +74,8 @@ crate::extension!(
     ops_builtin_v8::op_dispatch_exception,
     ops_builtin_v8::op_op_names,
     ops_builtin_v8::op_apply_source_map,
+    ops_builtin_v8::op_apply_source_map_filename,
+    ops_builtin_v8::op_current_user_call_site,
     ops_builtin_v8::op_set_format_exception_callback,
     ops_builtin_v8::op_event_loop_has_more_work,
     ops_builtin_v8::op_store_pending_promise_rejection,
@@ -129,25 +131,28 @@ pub async fn op_void_async_deferred() {}
 /// Remove a resource from the resource table.
 #[op2(core, fast)]
 pub fn op_close(
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
 ) -> Result<(), Error> {
-  state.resource_table.close(rid)?;
+  let resource = state.borrow_mut().resource_table.take_any(rid)?;
+  resource.close();
   Ok(())
 }
 
 /// Try to remove a resource from the resource table. If there is no resource
 /// with the specified `rid`, this is a no-op.
 #[op2(core, fast)]
-pub fn op_try_close(state: &mut OpState, #[smi] rid: ResourceId) {
-  let _ = state.resource_table.close(rid);
+pub fn op_try_close(state: Rc<RefCell<OpState>>, #[smi] rid: ResourceId) {
+  if let Ok(resource) = state.borrow_mut().resource_table.take_any(rid) {
+    resource.close();
+  }
 }
 
 #[op2(core)]
 #[serde]
 pub fn op_metrics(state: &mut OpState) -> (OpMetrics, Vec<OpMetrics>) {
   let aggregate = state.tracker.aggregate();
-  let per_op = state.tracker.per_op();
+  let per_op = state.tracker.per_op().clone();
   (aggregate, per_op)
 }
 
@@ -182,12 +187,14 @@ impl Resource for WasmStreamingResource {
 /// Feed bytes to WasmStreamingResource.
 #[op2(core, fast)]
 pub fn op_wasm_streaming_feed(
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
   #[buffer] bytes: &[u8],
 ) -> Result<(), Error> {
-  let wasm_streaming =
-    state.resource_table.get::<WasmStreamingResource>(rid)?;
+  let wasm_streaming = state
+    .borrow_mut()
+    .resource_table
+    .get::<WasmStreamingResource>(rid)?;
 
   wasm_streaming.0.borrow_mut().on_bytes_received(bytes);
 
@@ -268,21 +275,21 @@ async fn op_write(
 
 #[op2(core, fast)]
 fn op_read_sync(
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
   #[buffer] data: &mut [u8],
 ) -> Result<u32, Error> {
-  let resource = state.resource_table.get_any(rid)?;
+  let resource = state.borrow_mut().resource_table.get_any(rid)?;
   resource.read_byob_sync(data).map(|n| n as u32)
 }
 
 #[op2(core, fast)]
 fn op_write_sync(
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[smi] rid: ResourceId,
   #[buffer] data: &[u8],
 ) -> Result<u32, Error> {
-  let resource = state.resource_table.get_any(rid)?;
+  let resource = state.borrow_mut().resource_table.get_any(rid)?;
   let nwritten = resource.write_sync(data)?;
   Ok(nwritten as u32)
 }

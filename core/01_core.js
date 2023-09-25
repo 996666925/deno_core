@@ -800,6 +800,16 @@ for (let i = 0; i < 10; i++) {
     op_shutdown: shutdown,
   } = ensureFastOps();
 
+  const callSiteRetBuf = new Uint32Array(2);
+  const callSiteRetBufU8 = new Uint8Array(callSiteRetBuf.buffer);
+
+  function currentUserCallSite() {
+    const fileName = ops.op_current_user_call_site(callSiteRetBufU8);
+    const lineNumber = callSiteRetBuf[0];
+    const columnNumber = callSiteRetBuf[1];
+    return { fileName, lineNumber, columnNumber };
+  }
+
   // Extra Deno.core.* exports
   const core = ObjectAssign(globalThis.Deno.core, {
     asyncStub,
@@ -867,12 +877,13 @@ for (let i = 0; i < 10; i++) {
     byteLength: (str) => ops.op_str_byte_length(str),
     build,
     setBuildInfo,
+    currentUserCallSite,
   });
 
-  ObjectAssign(globalThis.__bootstrap, { core });
   const internals = {};
-  ObjectAssign(globalThis.__bootstrap, { internals });
+  ObjectAssign(globalThis.__bootstrap, { core, internals });
   ObjectAssign(globalThis.Deno, { core });
+  ObjectFreeze(globalThis.__bootstrap.core);
 
   // Direct bindings on `globalThis`
   ObjectAssign(globalThis, { queueMicrotask });

@@ -150,6 +150,9 @@ pub struct SerdeMarker;
 /// This primitive should be serialized as an SMI.
 pub struct SmiMarker;
 
+/// This primitive should be serialized as a number.
+pub struct NumberMarker;
+
 /// Helper macro for [`RustToV8`] to reduce boilerplate.
 ///
 /// Implements a Rust-to-v8 conversion that cannot fail. Multiple types may be specified
@@ -275,7 +278,13 @@ to_v8_retval!((f32, f64): |value, rv| rv.set_double(value as _));
 // Heavier primitives with no retval shortcuts
 //
 
-to_v8!((*const c_void, *mut c_void): |value, scope| v8::External::new(scope, value as _));
+to_v8!((*const c_void, *mut c_void): |value, scope| {
+  if value.is_null() {
+    v8::Local::<v8::Value>::from(v8::null(scope))
+  } else {
+    v8::Local::<v8::Value>::from(v8::External::new(scope, value as _))
+  }
+});
 to_v8!((u64, usize): |value, scope| v8::BigInt::new_from_u64(scope, value as _));
 to_v8!((i64, isize): |value, scope| v8::BigInt::new_from_i64(scope, value as _));
 
@@ -283,7 +292,7 @@ to_v8!((i64, isize): |value, scope| v8::BigInt::new_from_i64(scope, value as _))
 // Strings
 //
 
-to_v8_fallible!((String, Cow<'a, str>, &'a str): |value, scope| v8::String::new(scope, &value).ok_or_else(|| serde_v8::Error::Message("failed to allocate string".into())));
+to_v8_fallible!((String, Cow<'a, str>, &'a str): |value, scope| v8::String::new(scope, &value).ok_or_else(|| serde_v8::Error::Message("failed to allocate string; buffer exceeds maximum length".into())));
 to_v8_retval_fallible!((String, Cow<'a, str>, &'a str): |value, scope, rv| {
   if value.is_empty() {
     rv.set_empty_string();
@@ -292,7 +301,7 @@ to_v8_retval_fallible!((String, Cow<'a, str>, &'a str): |value, scope, rv| {
   }
   Ok(())
 });
-to_v8_fallible!(Cow<'a, [u8]>: |value, scope| v8::String::new_from_one_byte(scope, &value, v8::NewStringType::Normal).ok_or_else(|| serde_v8::Error::Message("failed to allocate string".into())));
+to_v8_fallible!(Cow<'a, [u8]>: |value, scope| v8::String::new_from_one_byte(scope, &value, v8::NewStringType::Normal).ok_or_else(|| serde_v8::Error::Message("failed to allocate string; buffer exceeds maximum length".into())));
 to_v8_retval_fallible!(Cow<'a, [u8]>: |value, scope, rv| {
   if value.is_empty() {
     rv.set_empty_string();
@@ -306,10 +315,11 @@ to_v8_retval_fallible!(Cow<'a, [u8]>: |value, scope, rv| {
 // Buffers
 //
 
-to_v8_fallible!(serde_v8::V8Slice: |value, scope| {
-  let (buffer, range) = value.into_parts();
-  let buffer = v8::ArrayBuffer::with_backing_store(scope, &buffer);
-  v8::Uint8Array::new(scope, buffer, range.start, range.len()).ok_or_else(|| serde_v8::Error::Message("failed to allocate array".into()))
+to_v8_fallible!(serde_v8::V8Slice<u8>: |value, scope| {
+  value.into_v8_local(scope).ok_or_else(|| serde_v8::Error::Message("failed to allocate array".into()))
+});
+to_v8_fallible!(serde_v8::V8Slice<u32>: |value, scope| {
+  value.into_v8_local(scope).ok_or_else(|| serde_v8::Error::Message("failed to allocate array".into()))
 });
 to_v8_fallible!(serde_v8::JsBuffer: |value, scope| {
   value.into_parts().to_v8_fallible(scope)
@@ -394,6 +404,36 @@ macro_rules! smi_to_v8 {
 }
 
 smi_to_v8!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
+
+//
+// 64-bit numbers
+//
+
+/// Implement an infallible SMI conversion from each of the integer types. SMI has a subset
+/// of the range of a normal integer, so we just do a bitwise cast.
+// TODO(mmastrac): We should be able to make these things much faster and without a scope
+macro_rules! number_64_bit_to_v8 {
+  ($($ty:ident),*) => {
+    $(
+      impl<'a> RustToV8<'a> for RustToV8Marker<NumberMarker, $ty>
+      {
+        #[inline(always)]
+        fn to_v8(self, scope: &mut v8::HandleScope<'a>) -> v8::Local<'a, v8::Value> {
+          v8::Number::new(scope, self.0 as _).into()
+        }
+      }
+
+      impl <'a> RustToV8RetVal<'a> for RustToV8Marker<NumberMarker, $ty> {
+        #[inline(always)]
+        fn to_v8_rv(self, rv: &mut v8::ReturnValue<'a>) {
+          rv.set_double(self.0 as _)
+        }
+      }
+    )*
+  };
+}
+
+number_64_bit_to_v8!(u64, usize, i64, isize);
 
 //
 // Globals

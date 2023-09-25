@@ -607,6 +607,62 @@ Safe, but forces a copy.
 <td>
 
 ```text
+#[buffer] &mut [u32]
+```
+
+</td><td>
+✅
+</td><td>
+UInt32Array (resizable=true,false)
+</td><td>
+⚠️ JS may modify the contents of the slice if V8 is called re-entrantly.
+</td></tr>
+<tr>
+<td>
+
+```text
+#[buffer] &[u32]
+```
+
+</td><td>
+✅
+</td><td>
+UInt32Array (resizable=true,false)
+</td><td>
+⚠️ JS may modify the contents of the slice if V8 is called re-entrantly.
+</td></tr>
+<tr>
+<td>
+
+```text
+#[buffer(copy)] Vec<u32>
+```
+
+</td><td>
+✅
+</td><td>
+UInt32Array (resizable=true,false)
+</td><td>
+Safe, but forces a copy.
+</td></tr>
+<tr>
+<td>
+
+```text
+#[buffer(copy)] Box<[u32]>
+```
+
+</td><td>
+✅
+</td><td>
+UInt32Array (resizable=true,false)
+</td><td>
+Safe, but forces a copy.
+</td></tr>
+<tr>
+<td>
+
+```text
 #[buffer] JsBuffer
 ```
 
@@ -728,6 +784,48 @@ Extracts an object from `OpState`.
 
 </td><td>
 Extracts an object from `OpState`.
+</td></tr>
+<tr>
+<td>
+
+```text
+&JsRuntimeState
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Only usable in `deno_core`.
+</td></tr>
+<tr>
+<td>
+
+```text
+&mut JsRuntimeState
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Only usable in `deno_core`.
+</td></tr>
+<tr>
+<td>
+
+```text
+Rc<RefCell<JsRuntimeState>>
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Only usable in `deno_core`.
 </td></tr>
 </table>
 
@@ -933,6 +1031,70 @@ SMI is internally represented as a signed integer, but unsigned `#[smi]` types w
 <td>
 
 ```text
+#[number] i64
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Result must fit within `Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
+#[number] u64
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Result must fit within `Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
+#[number] isize
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Result must fit within `Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
+#[number] usize
+```
+
+</td><td>
+✅
+</td><td>
+
+</td><td>
+Result must fit within `Number.MIN_SAFE_INTEGER` and `Number.MAX_SAFE_INTEGER`
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
 f32
 ```
 
@@ -1029,6 +1191,22 @@ f64
 <td>
 
 ```text
+#[buffer] V8Slice<u8>
+```
+
+</td><td>
+
+</td><td>
+
+</td><td>
+
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
 #[buffer] Vec<u8>
 ```
 
@@ -1062,6 +1240,22 @@ f64
 
 ```text
 #[buffer] bytes::BytesMut
+```
+
+</td><td>
+
+</td><td>
+
+</td><td>
+
+</td><td>
+
+</td></tr>
+<tr>
+<td>
+
+```text
+#[buffer] V8Slice<u32>
 ```
 
 </td><td>

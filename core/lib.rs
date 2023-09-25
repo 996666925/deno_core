@@ -21,7 +21,6 @@ mod path;
 mod resources;
 mod runtime;
 mod source_map;
-mod task_queue;
 
 // Re-exports
 pub use anyhow;
@@ -105,6 +104,7 @@ pub use crate::ops_builtin::op_print;
 pub use crate::ops_builtin::op_resources;
 pub use crate::ops_builtin::op_void_async;
 pub use crate::ops_builtin::op_void_sync;
+pub use crate::ops_metrics::OpMetrics;
 pub use crate::ops_metrics::OpsTracker;
 pub use crate::path::strip_unc_prefix;
 pub use crate::resources::AsyncResult;
@@ -126,8 +126,6 @@ pub use crate::runtime::Snapshot;
 pub use crate::runtime::V8_WRAPPER_OBJECT_INDEX;
 pub use crate::runtime::V8_WRAPPER_TYPE_INDEX;
 pub use crate::source_map::SourceMapGetter;
-pub use crate::task_queue::TaskQueue;
-pub use crate::task_queue::TaskQueuePermit;
 
 pub fn v8_version() -> &'static str {
   v8::V8::get_version()

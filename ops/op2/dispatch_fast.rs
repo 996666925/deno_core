@@ -6,6 +6,7 @@ use super::signature::Arg;
 use super::signature::Buffer;
 use super::signature::BufferMode;
 use super::signature::NumericArg;
+use super::signature::NumericFlag;
 use super::signature::ParsedSignature;
 use super::signature::RefType;
 use super::signature::RetVal;
@@ -159,17 +160,6 @@ pub fn generate_dispatch_fast(
     Some(rv) => rv,
   };
 
-  let GeneratorState {
-    fast_function,
-    deno_core,
-    result,
-    opctx,
-    fast_api_callback_options,
-    needs_fast_api_callback_options,
-    needs_fast_opctx,
-    ..
-  } = generator_state;
-
   // Collect the names and types for the fastcall and the underlying op call
   let mut fastcall_names = vec![];
   let mut fastcall_types = vec![];
@@ -180,21 +170,26 @@ pub fn generate_dispatch_fast(
     let name = format_ident!("arg{i}");
     if let Input::Concrete(fv) = input {
       fastcall_names.push(name.clone());
-      fastcall_types.push(fv.quote_rust_type(deno_core));
+      fastcall_types.push(fv.quote_rust_type(&generator_state.deno_core));
       input_types.push(fv.quote_type());
     }
 
     call_names.push(name.clone());
-    call_args.push(map_v8_fastcall_arg_to_arg(
-      deno_core,
-      opctx,
-      fast_api_callback_options,
-      needs_fast_opctx,
-      needs_fast_api_callback_options,
-      &name,
-      arg,
-    )?)
+    call_args.push(map_v8_fastcall_arg_to_arg(generator_state, &name, arg)?)
   }
+
+  let GeneratorState {
+    deno_core,
+    result,
+    fast_function,
+    opctx,
+    js_runtime_state,
+    fast_api_callback_options,
+    needs_fast_opctx,
+    needs_fast_api_callback_options,
+    needs_fast_js_runtime_state,
+    ..
+  } = generator_state;
 
   let handle_error = match signature.ret_val {
     RetVal::Infallible(_) => quote!(),
@@ -222,12 +217,23 @@ pub fn generate_dispatch_fast(
             // allowing us to perform this one little bit of mutable magic.
             unsafe { #opctx.unsafely_set_last_error_for_ops_only(err); }
             #fast_api_callback_options.fallback = true;
-            return ::std::default::Default::default();
+
+            // SAFETY: All fast return types have zero as a valid value
+            return unsafe { std::mem::zeroed() };
           }
         };
       }
     }
     _ => todo!(),
+  };
+
+  let with_js_runtime_state = if *needs_fast_js_runtime_state {
+    *needs_fast_opctx = true;
+    quote! {
+      let #js_runtime_state = std::rc::Weak::upgrade(&#opctx.runtime_state).unwrap();
+    }
+  } else {
+    quote!()
   };
 
   let with_opctx = if *needs_fast_opctx {
@@ -279,6 +285,7 @@ pub fn generate_dispatch_fast(
     ) -> #output_type {
       #with_fast_api_callback_options
       #with_opctx
+      #with_js_runtime_state
       let #result = {
         #(#call_args)*
         Self::call(#(#call_names),*)
@@ -292,48 +299,73 @@ pub fn generate_dispatch_fast(
   Ok(Some((fast_definition, fast_fn)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_v8_fastcall_arg_to_arg(
-  deno_core: &TokenStream,
-  opctx: &Ident,
-  fast_api_callback_options: &Ident,
-  needs_opctx: &mut bool,
-  needs_fast_api_callback_options: &mut bool,
+  generator_state: &mut GeneratorState,
   arg_ident: &Ident,
   arg: &Arg,
 ) -> Result<TokenStream, V8MappingError> {
+  let GeneratorState {
+    deno_core,
+    opctx,
+    js_runtime_state,
+    fast_api_callback_options,
+    needs_fast_opctx: needs_opctx,
+    needs_fast_api_callback_options,
+    needs_fast_js_runtime_state: needs_js_runtime_state,
+    ..
+  } = generator_state;
+
   let arg_temp = format_ident!("{}_temp", arg_ident);
+  let buf = quote!((
+    // SAFETY: we are certain the implied lifetime is valid here as the slices never escape the
+    // fastcall
+    unsafe { #deno_core::v8::fast_api::FastApiTypedArray::get_storage_from_pointer_if_aligned(#arg_ident) }.expect("Invalid buffer"))
+  );
   let res = match arg {
-    Arg::Buffer(Buffer::Slice(_, NumericArg::u8)) => {
-      quote!(let #arg_ident = unsafe { #arg_ident.as_mut().unwrap() }.get_storage_if_aligned().unwrap();)
+    Arg::Buffer(Buffer::Slice(_, NumericArg::u8 | NumericArg::u32)) => {
+      quote!(let #arg_ident = #buf;)
     }
-    Arg::Buffer(Buffer::Vec(NumericArg::u8)) => {
-      quote!(let #arg_ident = unsafe { #arg_ident.as_mut().unwrap() }.get_storage_if_aligned().unwrap().to_vec();)
+    Arg::Buffer(Buffer::Vec(NumericArg::u8 | NumericArg::u32)) => {
+      quote!(let #arg_ident = #buf.to_vec();)
     }
-    Arg::Buffer(Buffer::BoxSlice(NumericArg::u8)) => {
-      quote!(let #arg_ident = unsafe { #arg_ident.as_mut().unwrap() }.get_storage_if_aligned().unwrap().to_vec().into_boxed_slice();)
+    Arg::Buffer(Buffer::BoxSlice(NumericArg::u8 | NumericArg::u32)) => {
+      quote!(let #arg_ident = #buf.to_vec().into_boxed_slice();)
     }
     Arg::Buffer(Buffer::Bytes(BufferMode::Copy)) => {
-      quote!(let #arg_ident = unsafe { #arg_ident.as_mut().unwrap() }.get_storage_if_aligned().unwrap().to_vec().into();)
+      quote!(let #arg_ident = #buf.to_vec().into();)
     }
     Arg::Ref(RefType::Ref, Special::OpState) => {
       *needs_opctx = true;
-      quote!(let #arg_ident = &#opctx.state.borrow();)
+      quote!(let #arg_ident = &::std::cell::RefCell::borrow(&#opctx.state);)
     }
     Arg::Ref(RefType::Mut, Special::OpState) => {
       *needs_opctx = true;
-      quote!(let #arg_ident = &mut #opctx.state.borrow_mut();)
+      quote!(let #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#opctx.state);)
     }
     Arg::RcRefCell(Special::OpState) => {
       *needs_opctx = true;
       quote!(let #arg_ident = #opctx.state.clone();)
+    }
+    Arg::Ref(RefType::Ref, Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = &::std::cell::RefCell::borrow(&#js_runtime_state);)
+    }
+    Arg::Ref(RefType::Mut, Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#js_runtime_state);)
+    }
+    Arg::RcRefCell(Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = #js_runtime_state.clone();)
     }
     Arg::State(RefType::Ref, state) => {
       *needs_opctx = true;
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let #arg_ident = #opctx.state.borrow();
-        let #arg_ident = #arg_ident.borrow::<#state>();
+        let #arg_ident = ::std::cell::RefCell::borrow(&#opctx.state);
+        let #arg_ident = #deno_core::_ops::opstate_borrow::<#state>(&#arg_ident);
       }
     }
     Arg::State(RefType::Mut, state) => {
@@ -341,8 +373,8 @@ fn map_v8_fastcall_arg_to_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let mut #arg_ident = #opctx.state.borrow_mut();
-        let #arg_ident = #arg_ident.borrow_mut::<#state>();
+        let mut #arg_ident = ::std::cell::RefCell::borrow_mut(&#opctx.state);
+        let #arg_ident = #deno_core::_ops::opstate_borrow_mut::<#state>(&mut #arg_ident);
       }
     }
     Arg::OptionState(RefType::Ref, state) => {
@@ -350,7 +382,7 @@ fn map_v8_fastcall_arg_to_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let #arg_ident = #opctx.state.borrow();
+        let #arg_ident = &::std::cell::RefCell::borrow(&#opctx.state);
         let #arg_ident = #arg_ident.try_borrow::<#state>();
       }
     }
@@ -359,7 +391,7 @@ fn map_v8_fastcall_arg_to_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let mut #arg_ident = #opctx.state.borrow_mut();
+        let mut #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#opctx.state);
         let #arg_ident = #arg_ident.try_borrow_mut::<#state>();
       }
     }
@@ -392,7 +424,8 @@ fn map_v8_fastcall_arg_to_arg(
         *needs_fast_api_callback_options = true;
         Ok(quote! {
           #fast_api_callback_options.fallback = true;
-          return ::std::default::Default::default();
+          // SAFETY: All fast return types have zero as a valid value
+          return unsafe { std::mem::zeroed() };
         })
       };
       let extract_intermediate = v8_intermediate_to_arg(&arg_ident, arg);
@@ -420,16 +453,24 @@ fn map_arg_to_v8_fastcall_type(
       | Buffer::BoxSlice(NumericArg::u8)
       | Buffer::Bytes(BufferMode::Copy),
     ) => V8FastCallType::Uint8Array,
+    Arg::Buffer(
+      Buffer::Slice(_, NumericArg::u32)
+      | Buffer::Vec(NumericArg::u32)
+      | Buffer::BoxSlice(NumericArg::u32),
+    ) => V8FastCallType::Uint32Array,
     Arg::Buffer(_) => return Ok(None),
     // Virtual OpState arguments
     Arg::RcRefCell(Special::OpState)
     | Arg::Ref(_, Special::OpState)
+    | Arg::RcRefCell(Special::JsRuntimeState)
+    | Arg::Ref(_, Special::JsRuntimeState)
     | Arg::State(..)
     | Arg::OptionState(..) => V8FastCallType::Virtual,
     // Other types + ref types are not handled
-    Arg::OptionNumeric(_)
+    Arg::OptionNumeric(..)
     | Arg::Option(_)
     | Arg::OptionString(_)
+    | Arg::OptionBuffer(_)
     | Arg::SerdeV8(_)
     | Arg::Ref(..) => return Ok(None),
     // We don't support v8 global arguments
@@ -440,22 +481,26 @@ fn map_arg_to_v8_fastcall_type(
     | Arg::OptionV8Local(_)
     | Arg::OptionV8Ref(RefType::Ref, _) => V8FastCallType::V8Value,
 
-    Arg::Numeric(NumericArg::bool) => V8FastCallType::Bool,
-    Arg::Numeric(NumericArg::u32)
-    | Arg::Numeric(NumericArg::u16)
-    | Arg::Numeric(NumericArg::u8) => V8FastCallType::U32,
-    Arg::Numeric(NumericArg::i32)
-    | Arg::Numeric(NumericArg::i16)
-    | Arg::Numeric(NumericArg::i8)
-    | Arg::Numeric(NumericArg::__SMI__) => V8FastCallType::I32,
-    Arg::Numeric(NumericArg::u64) | Arg::Numeric(NumericArg::usize) => {
+    Arg::Numeric(NumericArg::bool, _) => V8FastCallType::Bool,
+    Arg::Numeric(NumericArg::u32, _)
+    | Arg::Numeric(NumericArg::u16, _)
+    | Arg::Numeric(NumericArg::u8, _) => V8FastCallType::U32,
+    Arg::Numeric(NumericArg::i32, _)
+    | Arg::Numeric(NumericArg::i16, _)
+    | Arg::Numeric(NumericArg::i8, _)
+    | Arg::Numeric(NumericArg::__SMI__, _) => V8FastCallType::I32,
+    Arg::Numeric(NumericArg::u64 | NumericArg::usize, NumericFlag::None) => {
       V8FastCallType::U64
     }
-    Arg::Numeric(NumericArg::i64) | Arg::Numeric(NumericArg::isize) => {
+    Arg::Numeric(NumericArg::i64 | NumericArg::isize, NumericFlag::None) => {
       V8FastCallType::I64
     }
-    Arg::Numeric(NumericArg::f32) => V8FastCallType::F32,
-    Arg::Numeric(NumericArg::f64) => V8FastCallType::F64,
+    Arg::Numeric(
+      NumericArg::u64 | NumericArg::usize | NumericArg::i64 | NumericArg::isize,
+      NumericFlag::Number,
+    ) => V8FastCallType::F64,
+    Arg::Numeric(NumericArg::f32, _) => V8FastCallType::F32,
+    Arg::Numeric(NumericArg::f64, _) => V8FastCallType::F64,
     // Ref strings that are one byte internally may be passed as a SeqOneByteString,
     // which gives us a FastApiOneByteString.
     Arg::String(Strings::RefStr) => V8FastCallType::SeqOneByteString,
@@ -475,28 +520,32 @@ fn map_retval_to_v8_fastcall_type(
   arg: &Arg,
 ) -> Result<Option<V8FastCallType>, V8MappingError> {
   let rv = match arg {
-    Arg::OptionNumeric(_) | Arg::SerdeV8(_) => return Ok(None),
+    Arg::OptionNumeric(..) | Arg::SerdeV8(_) => return Ok(None),
     Arg::Void => V8FastCallType::Void,
-    Arg::Numeric(NumericArg::bool) => V8FastCallType::Bool,
-    Arg::Numeric(NumericArg::u32)
-    | Arg::Numeric(NumericArg::u16)
-    | Arg::Numeric(NumericArg::u8) => V8FastCallType::U32,
-    Arg::Numeric(NumericArg::__SMI__)
-    | Arg::Numeric(NumericArg::i32)
-    | Arg::Numeric(NumericArg::i16)
-    | Arg::Numeric(NumericArg::i8) => V8FastCallType::I32,
-    Arg::Numeric(NumericArg::u64) | Arg::Numeric(NumericArg::usize) => {
+    Arg::Numeric(NumericArg::bool, _) => V8FastCallType::Bool,
+    Arg::Numeric(NumericArg::u32, _)
+    | Arg::Numeric(NumericArg::u16, _)
+    | Arg::Numeric(NumericArg::u8, _) => V8FastCallType::U32,
+    Arg::Numeric(NumericArg::__SMI__, _)
+    | Arg::Numeric(NumericArg::i32, _)
+    | Arg::Numeric(NumericArg::i16, _)
+    | Arg::Numeric(NumericArg::i8, _) => V8FastCallType::I32,
+    Arg::Numeric(NumericArg::u64 | NumericArg::usize, NumericFlag::None) => {
       // TODO(mmastrac): In my testing, I was not able to get this working properly
       // V8FastCallType::U64
       return Ok(None);
     }
-    Arg::Numeric(NumericArg::i64) | Arg::Numeric(NumericArg::isize) => {
+    Arg::Numeric(NumericArg::i64 | NumericArg::isize, NumericFlag::None) => {
       // TODO(mmastrac): In my testing, I was not able to get this working properly
       // V8FastCallType::I64
       return Ok(None);
     }
-    Arg::Numeric(NumericArg::f32) => V8FastCallType::F32,
-    Arg::Numeric(NumericArg::f64) => V8FastCallType::F64,
+    Arg::Numeric(
+      NumericArg::u64 | NumericArg::usize | NumericArg::i64 | NumericArg::isize,
+      NumericFlag::Number,
+    ) => V8FastCallType::F64,
+    Arg::Numeric(NumericArg::f32, _) => V8FastCallType::F32,
+    Arg::Numeric(NumericArg::f64, _) => V8FastCallType::F64,
     // We don't return special return types
     Arg::Option(_) => return Ok(None),
     Arg::OptionString(_) => return Ok(None),

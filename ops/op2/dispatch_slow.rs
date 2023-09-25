@@ -8,6 +8,7 @@ use super::signature::Arg;
 use super::signature::Buffer;
 use super::signature::External;
 use super::signature::NumericArg;
+use super::signature::NumericFlag;
 use super::signature::ParsedSignature;
 use super::signature::RefType;
 use super::signature::RetVal;
@@ -93,6 +94,12 @@ pub(crate) fn generate_dispatch_slow(
     quote!()
   };
 
+  let with_js_runtime_state = if generator_state.needs_js_runtime_state {
+    with_js_runtime_state(generator_state)
+  } else {
+    quote!()
+  };
+
   let with_opctx = if generator_state.needs_opctx {
     with_opctx(generator_state)
   } else {
@@ -120,6 +127,7 @@ pub(crate) fn generate_dispatch_slow(
         #with_opctx
         #with_isolate
         #with_opstate
+        #with_js_runtime_state
 
         #output
       }
@@ -175,6 +183,15 @@ pub(crate) fn with_opstate(
   )
 }
 
+pub(crate) fn with_js_runtime_state(
+  generator_state: &mut GeneratorState,
+) -> TokenStream {
+  generator_state.needs_opctx = true;
+  gs_quote!(generator_state(opctx, js_runtime_state) =>
+    (let #js_runtime_state = std::rc::Weak::upgrade(&#opctx.runtime_state).unwrap();)
+  )
+}
+
 pub fn extract_arg(
   generator_state: &mut GeneratorState,
   index: usize,
@@ -198,9 +215,11 @@ pub fn from_arg(
     args,
     scope,
     opstate,
+    js_runtime_state,
     needs_scope,
     needs_isolate,
     needs_opstate,
+    needs_js_runtime_state,
     ..
   } = &mut generator_state;
   let arg_ident = args
@@ -209,34 +228,39 @@ pub fn from_arg(
     .clone();
   let arg_temp = format_ident!("{}_temp", arg_ident);
   let res = match arg {
-    Arg::Numeric(NumericArg::bool) => quote! {
+    Arg::Numeric(NumericArg::bool, _) => quote! {
       let #arg_ident = #arg_ident.is_true();
     },
-    Arg::Numeric(NumericArg::u8)
-    | Arg::Numeric(NumericArg::u16)
-    | Arg::Numeric(NumericArg::u32) => {
+    Arg::Numeric(NumericArg::u8, _)
+    | Arg::Numeric(NumericArg::u16, _)
+    | Arg::Numeric(NumericArg::u32, _) => {
       from_arg_option(generator_state, &arg_ident, "u32")?
     }
-    Arg::Numeric(NumericArg::i8)
-    | Arg::Numeric(NumericArg::i16)
-    | Arg::Numeric(NumericArg::i32)
-    | Arg::Numeric(NumericArg::__SMI__) => {
+    Arg::Numeric(NumericArg::i8, _)
+    | Arg::Numeric(NumericArg::i16, _)
+    | Arg::Numeric(NumericArg::i32, _)
+    | Arg::Numeric(NumericArg::__SMI__, _) => {
       from_arg_option(generator_state, &arg_ident, "i32")?
     }
-    Arg::Numeric(NumericArg::u64) | Arg::Numeric(NumericArg::usize) => {
+    Arg::Numeric(NumericArg::u64 | NumericArg::usize, NumericFlag::None) => {
       from_arg_option(generator_state, &arg_ident, "u64")?
     }
-    Arg::Numeric(NumericArg::i64) | Arg::Numeric(NumericArg::isize) => {
+    Arg::Numeric(NumericArg::i64 | NumericArg::isize, NumericFlag::None) => {
       from_arg_option(generator_state, &arg_ident, "i64")?
     }
-    Arg::Numeric(NumericArg::f32) => {
+    Arg::Numeric(
+      NumericArg::u64 | NumericArg::usize | NumericArg::i64 | NumericArg::isize,
+      NumericFlag::Number,
+    ) => from_arg_option(generator_state, &arg_ident, "f64")?,
+    Arg::Numeric(NumericArg::f32, _) => {
       from_arg_option(generator_state, &arg_ident, "f32")?
     }
-    Arg::Numeric(NumericArg::f64) => {
+    Arg::Numeric(NumericArg::f64, _) => {
       from_arg_option(generator_state, &arg_ident, "f64")?
     }
-    Arg::OptionNumeric(numeric) => {
-      let some = from_arg(generator_state, index, &Arg::Numeric(*numeric))?;
+    Arg::OptionNumeric(numeric, flag) => {
+      let some =
+        from_arg(generator_state, index, &Arg::Numeric(*numeric, *flag))?;
       quote! {
         let #arg_ident = if #arg_ident.is_null_or_undefined() {
           None
@@ -298,7 +322,27 @@ pub fn from_arg(
       })
     }
     Arg::Buffer(buffer) => {
-      from_arg_buffer(generator_state, &arg_ident, buffer)?
+      // Explicit temporary lifetime extension so we can take a reference
+      let temp = format_ident!("{}_temp", arg_ident);
+      let buffer = from_arg_buffer(generator_state, &arg_ident, buffer, &temp)?;
+      quote! {
+        let mut #temp;
+        #buffer
+      }
+    }
+    Arg::OptionBuffer(buffer) => {
+      // Explicit temporary lifetime extension so we can take a reference
+      let temp = format_ident!("{}_temp", arg_ident);
+      let some = from_arg_buffer(generator_state, &arg_ident, buffer, &temp)?;
+      quote! {
+        let mut #temp;
+        let #arg_ident = if #arg_ident.is_null_or_undefined() {
+          None
+        } else {
+          #some
+          Some(#arg_ident)
+        };
+      }
     }
     Arg::External(External::Ptr(_)) => {
       from_arg_option(generator_state, &arg_ident, "external")?
@@ -309,23 +353,35 @@ pub fn from_arg(
     }
     Arg::Ref(RefType::Ref, Special::OpState) => {
       *needs_opstate = true;
-      quote!(let #arg_ident = &#opstate.borrow();)
+      quote!(let #arg_ident = &::std::cell::RefCell::borrow(&#opstate);)
     }
     Arg::Ref(RefType::Mut, Special::OpState) => {
       *needs_opstate = true;
-      quote!(let #arg_ident = &mut #opstate.borrow_mut();)
+      quote!(let #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#opstate);)
     }
     Arg::RcRefCell(Special::OpState) => {
       *needs_opstate = true;
       quote!(let #arg_ident = #opstate.clone();)
+    }
+    Arg::Ref(RefType::Ref, Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = &::std::cell::RefCell::borrow(&#js_runtime_state);)
+    }
+    Arg::Ref(RefType::Mut, Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#js_runtime_state);)
+    }
+    Arg::RcRefCell(Special::JsRuntimeState) => {
+      *needs_js_runtime_state = true;
+      quote!(let #arg_ident = #js_runtime_state.clone();)
     }
     Arg::State(RefType::Ref, state) => {
       *needs_opstate = true;
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let #arg_ident = #opstate.borrow();
-        let #arg_ident = #arg_ident.borrow::<#state>();
+        let #arg_ident = ::std::cell::RefCell::borrow(&#opstate);
+        let #arg_ident = #deno_core::_ops::opstate_borrow::<#state>(&#arg_ident);
       }
     }
     Arg::State(RefType::Mut, state) => {
@@ -333,8 +389,8 @@ pub fn from_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let mut #arg_ident = #opstate.borrow_mut();
-        let #arg_ident = #arg_ident.borrow_mut::<#state>();
+        let mut #arg_ident = ::std::cell::RefCell::borrow_mut(&#opstate);
+        let #arg_ident = #deno_core::_ops::opstate_borrow_mut::<#state>(&mut #arg_ident);
       }
     }
     Arg::OptionState(RefType::Ref, state) => {
@@ -342,7 +398,7 @@ pub fn from_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let #arg_ident = #opstate.borrow();
+        let #arg_ident = &::std::cell::RefCell::borrow(&#opstate);
         let #arg_ident = #arg_ident.try_borrow::<#state>();
       }
     }
@@ -351,7 +407,7 @@ pub fn from_arg(
       let state =
         syn::parse_str::<Type>(state).expect("Failed to reparse state type");
       quote! {
-        let mut #arg_ident = #opstate.borrow_mut();
+        let mut #arg_ident = &mut ::std::cell::RefCell::borrow_mut(&#opstate);
         let #arg_ident = #arg_ident.try_borrow_mut::<#state>();
       }
     }
@@ -431,16 +487,14 @@ pub fn from_arg_buffer(
   generator_state: &mut GeneratorState,
   arg_ident: &Ident,
   buffer: &Buffer,
+  temp: &Ident,
 ) -> Result<TokenStream, V8MappingError> {
   let err = format_ident!("{}_err", arg_ident);
   let throw_exception = throw_type_error_static_string(generator_state, &err)?;
 
   generator_state.needs_scope = true;
 
-  // TODO(mmastrac): Other buffer types
-  let array = NumericArg::u8
-    .v8_array_type()
-    .expect("Could not retrieve the v8 type");
+  let array = buffer.element();
 
   let to_v8_slice = if matches!(buffer, Buffer::JsBuffer(BufferMode::Detach)) {
     quote!(to_v8_slice_detachable)
@@ -449,7 +503,7 @@ pub fn from_arg_buffer(
   };
 
   let make_v8slice = gs_quote!(generator_state(deno_core, scope) => {
-    let mut #arg_ident = match unsafe { #deno_core::_ops::#to_v8_slice::<#deno_core::v8::#array>(&mut #scope, #arg_ident) } {
+    #temp = match unsafe { #deno_core::_ops::#to_v8_slice::<#array>(&mut #scope, #arg_ident) } {
       Ok(#arg_ident) => #arg_ident,
       Err(#err) => {
         #throw_exception
@@ -458,20 +512,23 @@ pub fn from_arg_buffer(
   });
 
   let make_arg = match buffer {
-    Buffer::Slice(_, NumericArg::u8) => {
-      quote!(let #arg_ident = &mut #arg_ident;)
+    Buffer::Slice(RefType::Ref, NumericArg::u8 | NumericArg::u32) => {
+      quote!(let #arg_ident = #temp.as_ref();)
     }
-    Buffer::Vec(NumericArg::u8) => {
-      quote!(let #arg_ident = #arg_ident.to_vec();)
+    Buffer::Slice(RefType::Mut, NumericArg::u8 | NumericArg::u32) => {
+      quote!(let #arg_ident = #temp.as_mut();)
     }
-    Buffer::BoxSlice(NumericArg::u8) => {
-      quote!(let #arg_ident = #arg_ident.to_boxed_slice();)
+    Buffer::Vec(NumericArg::u8 | NumericArg::u32) => {
+      quote!(let #arg_ident = #temp.to_vec();)
+    }
+    Buffer::BoxSlice(NumericArg::u8 | NumericArg::u32) => {
+      quote!(let #arg_ident = #temp.to_boxed_slice();)
     }
     Buffer::Bytes(BufferMode::Copy) => {
-      quote!(let #arg_ident = #arg_ident.to_vec().into();)
+      quote!(let #arg_ident = #temp.to_vec().into();)
     }
     Buffer::JsBuffer(BufferMode::Default | BufferMode::Detach) => {
-      gs_quote!(generator_state(deno_core) => (let #arg_ident = #deno_core::serde_v8::JsBuffer::from_parts(#arg_ident);))
+      gs_quote!(generator_state(deno_core) => (let #arg_ident = #deno_core::serde_v8::JsBuffer::from_parts(#temp);))
     }
     _ => {
       return Err(V8MappingError::NoMapping(
@@ -523,6 +580,9 @@ pub fn return_value_infallible(
     }
     ArgMarker::Smi => {
       gs_quote!(generator_state(deno_core, result) => (#deno_core::_ops::RustToV8Marker::<#deno_core::_ops::SmiMarker, _>::from(#result)))
+    }
+    ArgMarker::Number => {
+      gs_quote!(generator_state(deno_core, result) => (#deno_core::_ops::RustToV8Marker::<#deno_core::_ops::NumberMarker, _>::from(#result)))
     }
     ArgMarker::None => gs_quote!(generator_state(result) => (#result)),
   };
@@ -584,6 +644,9 @@ pub fn return_value_v8_value(
     }
     ArgMarker::Smi => {
       quote!(#deno_core::_ops::RustToV8Marker::<#deno_core::_ops::SmiMarker, _>::from(#result))
+    }
+    ArgMarker::Number => {
+      quote!(#deno_core::_ops::RustToV8Marker::<#deno_core::_ops::NumberMarker, _>::from(#result))
     }
     ArgMarker::None => quote!(#result),
   };
@@ -702,7 +765,7 @@ fn throw_type_error_string(
     #maybe_scope
     // TODO(mmastrac): This might be allocating too much, even if it's on the error path
     let msg = #deno_core::v8::String::new(&mut #scope, &format!("{}", #deno_core::anyhow::Error::from(#message))).unwrap();
-    let exc = #deno_core::v8::Exception::error(&mut #scope, msg);
+    let exc = #deno_core::v8::Exception::type_error(&mut #scope, msg);
     #scope.throw_exception(exc);
     return;
   }))
@@ -722,7 +785,7 @@ fn throw_type_error_static_string(
   Ok(gs_quote!(generator_state(deno_core, scope) => {
     #maybe_scope
     let msg = #deno_core::v8::String::new_from_one_byte(&mut #scope, #message.as_bytes(), #deno_core::v8::NewStringType::Normal).unwrap();
-    let exc = #deno_core::v8::Exception::error(&mut #scope, msg);
+    let exc = #deno_core::v8::Exception::type_error(&mut #scope, msg);
     #scope.throw_exception(exc);
     return;
   }))

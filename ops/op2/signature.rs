@@ -12,6 +12,7 @@ use strum::IntoEnumIterator;
 use strum::IntoStaticStr;
 use strum_macros::EnumIter;
 use strum_macros::EnumString;
+use syn::AttrStyle;
 use syn::Attribute;
 use syn::FnArg;
 use syn::GenericParam;
@@ -140,6 +141,7 @@ impl ToTokens for V8Arg {
 pub enum Special {
   HandleScope,
   OpState,
+  JsRuntimeState,
   FastApiCallbackOptions,
 }
 
@@ -167,13 +169,13 @@ pub enum Buffer {
   /// Owned, copy. Stored in `bytes::BytesMut`
   BytesMut(BufferMode),
   /// Shared, not resizable (or resizable and detatched), stored in `serde_v8::V8Slice`
-  V8Slice(BufferMode),
+  V8Slice(BufferMode, NumericArg),
   /// Shared, not resizable (or resizable and detatched), stored in `serde_v8::JsBuffer`
   JsBuffer(BufferMode),
 }
 
 impl Buffer {
-  const fn valid_modes(
+  pub const fn valid_modes(
     &self,
     position: Position,
   ) -> &'static [AttributeModifier] {
@@ -193,6 +195,17 @@ impl Buffer {
       },
     }
   }
+
+  pub const fn element(&self) -> NumericArg {
+    match self {
+      Self::Slice(_, arg) => *arg,
+      Self::BoxSlice(arg) => *arg,
+      Self::Bytes(_) | Self::BytesMut(_) | Self::JsBuffer(_) => NumericArg::u8,
+      Self::Ptr(_, arg) => *arg,
+      Self::Vec(arg) => *arg,
+      Self::V8Slice(_, arg) => *arg,
+    }
+  }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -205,6 +218,12 @@ pub enum External {
 pub enum RefType {
   Ref,
   Mut,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum NumericFlag {
+  None,
+  Number,
 }
 
 /// Args are not a 1:1 mapping with Rust types, rather they represent broad classes of types that
@@ -221,14 +240,15 @@ pub enum Arg {
   RcRefCell(Special),
   Option(Special),
   OptionString(Strings),
-  OptionNumeric(NumericArg),
+  OptionNumeric(NumericArg, NumericFlag),
+  OptionBuffer(Buffer),
   OptionV8Local(V8Arg),
   OptionV8Global(V8Arg),
   V8Local(V8Arg),
   V8Global(V8Arg),
   OptionV8Ref(RefType, V8Arg),
   V8Ref(RefType, V8Arg),
-  Numeric(NumericArg),
+  Numeric(NumericArg, NumericFlag),
   SerdeV8(String),
   State(RefType, String),
   OptionState(RefType, String),
@@ -243,17 +263,20 @@ impl Arg {
       Self::Special(
         Special::FastApiCallbackOptions
         | Special::OpState
+        | Special::JsRuntimeState
         | Special::HandleScope,
       ) => true,
       Self::Ref(
         _,
         Special::FastApiCallbackOptions
         | Special::OpState
+        | Special::JsRuntimeState
         | Special::HandleScope,
       ) => true,
       Self::RcRefCell(
         Special::FastApiCallbackOptions
         | Special::OpState
+        | Special::JsRuntimeState
         | Special::HandleScope,
       ) => true,
       Self::State(..) | Self::OptionState(..) => true,
@@ -295,6 +318,7 @@ impl Arg {
         | Arg::OptionNumeric(..)
         | Arg::Option(..)
         | Arg::OptionString(..)
+        | Arg::OptionBuffer(..)
         | Arg::OptionState(..)
     )
   }
@@ -305,9 +329,10 @@ impl Arg {
       Arg::OptionV8Ref(r, t) => Arg::V8Ref(*r, *t),
       Arg::OptionV8Local(t) => Arg::V8Local(*t),
       Arg::OptionV8Global(t) => Arg::V8Global(*t),
-      Arg::OptionNumeric(t) => Arg::Numeric(*t),
+      Arg::OptionNumeric(t, flag) => Arg::Numeric(*t, *flag),
       Arg::Option(t) => Arg::Special(*t),
       Arg::OptionString(t) => Arg::String(*t),
+      Arg::OptionBuffer(t) => Arg::Buffer(*t),
       Arg::OptionState(r, t) => Arg::State(*r, t.clone()),
       _ => return None,
     })
@@ -330,8 +355,16 @@ impl Arg {
           | NumericArg::u64
           | NumericArg::isize
           | NumericArg::usize,
+          NumericFlag::None,
         ) => ArgSlowRetval::V8Local,
-        Arg::Void | Arg::Numeric(_) => ArgSlowRetval::RetVal,
+        Arg::Numeric(
+          NumericArg::i64
+          | NumericArg::u64
+          | NumericArg::isize
+          | NumericArg::usize,
+          NumericFlag::Number,
+        ) => ArgSlowRetval::RetVal,
+        Arg::Void | Arg::Numeric(..) => ArgSlowRetval::RetVal,
         Arg::External(_) => ArgSlowRetval::V8Local,
         // Fast return value path for empty strings
         Arg::String(_) => ArgSlowRetval::RetValFallible,
@@ -341,8 +374,18 @@ impl Arg {
         Arg::V8Global(_) => ArgSlowRetval::V8Local,
         Arg::Buffer(
           Buffer::JsBuffer(BufferMode::Default)
-          | Buffer::Vec(NumericArg::u8)
-          | Buffer::BoxSlice(NumericArg::u8)
+          | Buffer::Vec(NumericArg::u8 | NumericArg::u32)
+          | Buffer::BoxSlice(NumericArg::u8 | NumericArg::u32)
+          | Buffer::V8Slice(
+            BufferMode::Default,
+            NumericArg::u8 | NumericArg::u32,
+          )
+          | Buffer::BytesMut(BufferMode::Default),
+        ) => ArgSlowRetval::V8LocalFalliable,
+        Arg::OptionBuffer(
+          Buffer::JsBuffer(BufferMode::Default)
+          | Buffer::Vec(NumericArg::u8 | NumericArg::u32)
+          | Buffer::BoxSlice(NumericArg::u8 | NumericArg::u32)
           | Buffer::BytesMut(BufferMode::Default),
         ) => ArgSlowRetval::V8LocalFalliable,
         _ => ArgSlowRetval::None,
@@ -354,7 +397,8 @@ impl Arg {
   pub fn marker(&self) -> ArgMarker {
     match self {
       Arg::SerdeV8(_) => ArgMarker::Serde,
-      Arg::Numeric(NumericArg::__SMI__) => ArgMarker::Smi,
+      Arg::Numeric(NumericArg::__SMI__, _) => ArgMarker::Smi,
+      Arg::Numeric(_, NumericFlag::Number) => ArgMarker::Number,
       _ => ArgMarker::None,
     }
   }
@@ -387,6 +431,8 @@ pub enum ArgMarker {
   Serde,
   /// This type should be serialized as an SMI.
   Smi,
+  /// This type should be serialized as a number.
+  Number,
 }
 
 pub enum ParsedType {
@@ -413,7 +459,7 @@ impl ParsedType {
         | NumericArg::i64
         | NumericArg::usize
         | NumericArg::isize,
-      ) => Some(&[AttributeModifier::Bigint]),
+      ) => Some(&[AttributeModifier::Bigint, AttributeModifier::Number]),
       TBuffer(buffer) => Some(buffer.valid_modes(position)),
       TString(Strings::CowByte) => {
         Some(&[AttributeModifier::String(StringMode::OneByte)])
@@ -573,14 +619,17 @@ pub enum AttributeModifier {
   Buffer(BufferMode),
   /// #[global], for [`v8::Global`]s
   Global,
-  /// #[bigint], for u64/usize/i64/isize
+  /// #[bigint], for u64/usize/i64/isize indicating value is a BigInt
   Bigint,
+  /// #[number], for u64/usize/i64/isize indicating value is a Number
+  Number,
 }
 
 impl AttributeModifier {
   fn name(&self) -> &'static str {
     match self {
       AttributeModifier::Bigint => "bigint",
+      AttributeModifier::Number => "bigint",
       AttributeModifier::Buffer(_) => "buffer",
       AttributeModifier::Smi => "smi",
       AttributeModifier::Serde => "serde",
@@ -613,12 +662,16 @@ pub enum SignatureError {
   InvalidWherePredicate(String),
   #[error("State may be either a single OpState parameter, one mutable #[state], or multiple immultiple #[state]s")]
   InvalidOpStateCombination,
+  #[error("JsRuntimeState may only be used in one parameter")]
+  InvalidMultipleJsRuntimeState,
 }
 
 #[derive(Error, Debug)]
 pub enum AttributeError {
   #[error("Unknown or invalid attribute '{0}'")]
   InvalidAttribute(String),
+  #[error("Invalid inner attribute (#![attr]) in this position. Use an equivalent outer attribute (#[attr]) on the function instead.")]
+  InvalidInnerAttribute,
   #[error("Too many attributes")]
   TooManyAttributes,
 }
@@ -631,6 +684,8 @@ pub enum ArgError {
   InvalidType(String, &'static str),
   #[error("Invalid numeric argument type: {0}")]
   InvalidNumericType(String),
+  #[error("Invalid numeric #[smi] argument type: {0}")]
+  InvalidSmiType(String),
   #[error(
     "Invalid argument type path (should this be #[smi] or #[serde]?): {0}"
   )]
@@ -645,6 +700,8 @@ pub enum ArgError {
   InvalidAttributeType(&'static str, String),
   #[error("Cannot use #[serde] for type: {0}")]
   InvalidSerdeAttributeType(String),
+  #[error("Cannot use #[number] for type: {0}")]
+  InvalidNumberAttributeType(String),
   #[error("Invalid v8 type: {0}")]
   InvalidV8Type(String),
   #[error("Internal error: {0}")]
@@ -657,6 +714,8 @@ pub enum ArgError {
   AttributeError(#[from] AttributeError),
   #[error("The type '{0}' is not allowed in this position")]
   NotAllowedInThisPosition(String),
+  #[error("Invalid deno_core:: prefix for type '{0}'. Try adding `use deno_core::{1}` at the top of the file and specifying `{2}` in this position.")]
+  InvalidDenoCorePrefix(String, String, String),
 }
 
 #[derive(Error, Debug)]
@@ -732,6 +791,8 @@ pub fn parse_signature(
   let mut has_mut_state = false;
   let mut has_ref_state = false;
 
+  let mut jsruntimestate_count = 0;
+
   for arg in &args {
     match arg {
       Arg::RcRefCell(Special::OpState) | Arg::Ref(_, Special::OpState) => {
@@ -746,6 +807,12 @@ pub fn parse_signature(
         }
         has_mut_state = true;
       }
+      Arg::Ref(_, Special::JsRuntimeState) => {
+        jsruntimestate_count += 1;
+      }
+      Arg::RcRefCell(Special::JsRuntimeState) => {
+        jsruntimestate_count += 1;
+      }
       _ => {}
     }
   }
@@ -753,6 +820,11 @@ pub fn parse_signature(
   // Ensure that either zero or one and only one of these are true
   if has_opstate as u8 + has_mut_state as u8 + has_ref_state as u8 > 1 {
     return Err(SignatureError::InvalidOpStateCombination);
+  }
+
+  // Ensure that there is at most one JsRuntimeState
+  if jsruntimestate_count > 1 {
+    return Err(SignatureError::InvalidMultipleJsRuntimeState);
   }
 
   Ok(ParsedSignature {
@@ -930,9 +1002,13 @@ fn parse_attribute(
   attr: &Attribute,
 ) -> Result<Option<AttributeModifier>, AttributeError> {
   let tokens = attr.into_token_stream();
+  if matches!(attr.style, AttrStyle::Inner(_)) {
+    return Err(AttributeError::InvalidInnerAttribute);
+  }
   let res = std::panic::catch_unwind(|| {
     rules!(tokens => {
       (#[bigint]) => Some(AttributeModifier::Bigint),
+      (#[number]) => Some(AttributeModifier::Number),
       (#[serde]) => Some(AttributeModifier::Serde),
       (#[smi]) => Some(AttributeModifier::Smi),
       (#[string]) => Some(AttributeModifier::String(StringMode::Default)),
@@ -945,6 +1021,7 @@ fn parse_attribute(
       (#[global]) => Some(AttributeModifier::Global),
       (#[allow ($_rule:path)]) => None,
       (#[doc = $_attr:literal]) => None,
+      (#[cfg $_cfg:tt]) => None,
     })
   }).map_err(|_| AttributeError::InvalidAttribute(stringify_token(attr)))?;
   Ok(res)
@@ -960,12 +1037,14 @@ fn parse_numeric_type(tp: &Path) -> Result<NumericArg, ArgError> {
     }
   }
 
-  let res = std::panic::catch_unwind(|| {
+  let Ok(Some(res)) = std::panic::catch_unwind(|| {
     rules!(tp.into_token_stream() => {
-      ( $( std :: ffi :: )? c_void ) => NumericArg::__VOID__,
+      ( $( std :: ffi :: )? c_void ) => Some(NumericArg::__VOID__),
+      ( $_ty:ty ) => None,
     })
-  })
-  .map_err(|_| ArgError::InvalidNumericType(stringify_token(tp)))?;
+  }) else {
+    return Err(ArgError::InvalidNumericType(stringify_token(tp)));
+  };
 
   Ok(res)
 }
@@ -1011,8 +1090,8 @@ fn parse_type_path(
       ( $( std :: boxed ::)? Box < [ $ty:path ] > ) => {
         Ok(CBare(TBuffer(Buffer::BoxSlice(parse_numeric_type(&ty)?))))
       }
-      ( $( serde_v8 :: )? V8Slice ) => {
-        Ok(CBare(TBuffer(Buffer::V8Slice(buffer_mode()?))))
+      ( $( serde_v8 :: )? V8Slice < $ty:path > ) => {
+        Ok(CBare(TBuffer(Buffer::V8Slice(buffer_mode()?, parse_numeric_type(&ty)?))))
       }
       ( $( serde_v8 :: )? JsBuffer ) => {
         Ok(CBare(TBuffer(Buffer::JsBuffer(buffer_mode()?))))
@@ -1024,17 +1103,18 @@ fn parse_type_path(
         Ok(CBare(TBuffer(Buffer::BytesMut(buffer_mode()?))))
       }
       ( OpState ) => Ok(CBare(TSpecial(Special::OpState))),
+      ( JsRuntimeState ) => Ok(CBare(TSpecial(Special::JsRuntimeState))),
       ( v8 :: HandleScope $( < $_scope:lifetime >)? ) => Ok(CBare(TSpecial(Special::HandleScope))),
       ( v8 :: FastApiCallbackOptions ) => Ok(CBare(TSpecial(Special::FastApiCallbackOptions))),
       ( v8 :: Local < $( $_scope:lifetime , )? v8 :: $v8:ident >) => Ok(CV8Local(TV8(parse_v8_type(&v8)?))),
       ( v8 :: Global < $( $_scope:lifetime , )? v8 :: $v8:ident >) => Ok(CV8Global(TV8(parse_v8_type(&v8)?))),
       ( v8 :: $v8:ident ) => Ok(CBare(TV8(parse_v8_type(&v8)?))),
-      ( Rc < RefCell < $ty:ty > > ) => Ok(CRcRefCell(TSpecial(parse_type_special(position, attrs, &ty)?))),
+      ( $( std :: rc :: )? Rc < RefCell < $ty:ty > > ) => Ok(CRcRefCell(TSpecial(parse_type_special(position, attrs, &ty)?))),
       ( Option < $ty:ty > ) => {
         match parse_type(position, attrs, &ty)? {
           Arg::Special(special) => Ok(COption(TSpecial(special))),
           Arg::String(string) => Ok(COption(TString(string))),
-          Arg::Numeric(numeric) => Ok(COption(TNumeric(numeric))),
+          Arg::Numeric(numeric, _) => Ok(COption(TNumeric(numeric))),
           Arg::Buffer(buffer) => Ok(COption(TBuffer(buffer))),
           Arg::V8Ref(RefType::Ref, v8) => Ok(COption(TV8(v8))),
           Arg::V8Ref(RefType::Mut, v8) => Ok(COption(TV8Mut(v8))),
@@ -1043,7 +1123,15 @@ fn parse_type_path(
           _ => Err(ArgError::InvalidType(stringify_token(ty), "for option"))
         }
       }
-      ( $any:ty ) => Err(ArgError::InvalidTypePath(stringify_token(any))),
+      ( deno_core :: $next:ident $(:: $any:ty)? ) => {
+        // Stylistically it makes more sense just to import deno_core::v8 and other types at the top of the file
+        let any = any.map(|any| format!("::{}", any.into_token_stream())).unwrap_or_default();
+        let instead = format!("{next}{any}");
+        Err(ArgError::InvalidDenoCorePrefix(stringify_token(tp), stringify_token(next), instead))
+      }
+      ( $any:ty ) => {
+        Err(ArgError::InvalidTypePath(stringify_token(any)))
+      }
     })
   }).map_err(|e| ArgError::InternalError(format!("parse_type_path {e:?}")))??
   };
@@ -1051,8 +1139,9 @@ fn parse_type_path(
   // Ensure that we have the correct reference state. This is a bit awkward but it's
   // the easiest way to work with the 'rules!' macro above.
   match res {
-    // OpState appears in both ways
+    // OpState and JsRuntimeState appears in both ways
     CBare(TSpecial(Special::OpState)) => {}
+    CBare(TSpecial(Special::JsRuntimeState)) => {}
     CBare(
       TString(Strings::RefStr) | TSpecial(Special::HandleScope) | TV8(_),
     ) => {
@@ -1152,7 +1241,8 @@ pub(crate) fn parse_type(
           let token = stringify_token(of.path.clone());
           if let Ok(Some(err)) = std::panic::catch_unwind(|| {
             rules!(ty => {
-              ( $( serde_v8:: )? Value $( < $_lifetime:lifetime >)? ) => Some("use v8::Value"),
+              ( serde_v8::Value $( < $_lifetime:lifetime >)? ) => Some("use v8::Value"),
+              ( Value $( < $_lifetime:lifetime >)? ) => Some("use a fully-qualified type: v8::Value or serde_json::Value"),
               ( $_ty:ty ) => None,
             })
           }) {
@@ -1174,9 +1264,47 @@ pub(crate) fn parse_type(
       | AttributeModifier::Global => {
         // We handle this as part of the normal parsing process
       }
-      AttributeModifier::Smi => {
-        return Ok(Arg::Numeric(NumericArg::__SMI__));
-      }
+      AttributeModifier::Number => match ty {
+        Type::Path(of) => match parse_type_path(position, attrs, false, of)? {
+          COption(TNumeric(
+            n @ (NumericArg::u64
+            | NumericArg::usize
+            | NumericArg::i64
+            | NumericArg::isize),
+          )) => return Ok(Arg::OptionNumeric(n, NumericFlag::Number)),
+          CBare(TNumeric(
+            n @ (NumericArg::u64
+            | NumericArg::usize
+            | NumericArg::i64
+            | NumericArg::isize),
+          )) => return Ok(Arg::Numeric(n, NumericFlag::Number)),
+          _ => {
+            return Err(ArgError::InvalidNumberAttributeType(stringify_token(
+              ty,
+            )))
+          }
+        },
+        _ => {
+          return Err(ArgError::InvalidNumberAttributeType(stringify_token(ty)))
+        }
+      },
+      AttributeModifier::Smi => match ty {
+        Type::Path(of) => {
+          let is_option = rules!(of.into_token_stream() => {
+            ( Option < $_ty:ty > ) => true,
+            ( $_ty:ty ) => false,
+          });
+          if is_option {
+            return Ok(Arg::OptionNumeric(
+              NumericArg::__SMI__,
+              NumericFlag::None,
+            ));
+          } else {
+            return Ok(Arg::Numeric(NumericArg::__SMI__, NumericFlag::None));
+          }
+        }
+        _ => return Err(ArgError::InvalidSmiType(stringify_token(ty))),
+      },
     }
   };
   match ty {
@@ -1248,13 +1376,16 @@ pub(crate) fn parse_type(
       }
     }
     Type::Path(of) => match parse_type_path(position, attrs, false, of)? {
-      CBare(TNumeric(numeric)) => Ok(Arg::Numeric(numeric)),
+      CBare(TNumeric(numeric)) => Ok(Arg::Numeric(numeric, NumericFlag::None)),
       CBare(TSpecial(special)) => Ok(Arg::Special(special)),
       CBare(TString(string)) => Ok(Arg::String(string)),
       CBare(TBuffer(buffer)) => Ok(Arg::Buffer(buffer)),
-      COption(TNumeric(special)) => Ok(Arg::OptionNumeric(special)),
+      COption(TNumeric(special)) => {
+        Ok(Arg::OptionNumeric(special, NumericFlag::None))
+      }
       COption(TSpecial(special)) => Ok(Arg::Option(special)),
       COption(TString(string)) => Ok(Arg::OptionString(string)),
+      COption(TBuffer(buffer)) => Ok(Arg::OptionBuffer(buffer)),
       CRcRefCell(TSpecial(special)) => Ok(Arg::RcRefCell(special)),
       COptionV8Local(TV8(v8)) => Ok(Arg::OptionV8Local(v8)),
       COptionV8Global(TV8(v8)) => Ok(Arg::OptionV8Global(v8)),
@@ -1380,12 +1511,16 @@ mod tests {
     let attrs = item_fn.attrs;
     let err = parse_signature(attrs, item_fn.sig)
       .expect_err("Expected function to fail to parse");
-    assert_eq!(format!("{err:?}"), error.to_owned());
+    // TODO(mmastrac): this might fail if debug output spacing changes
+    assert_eq!(
+      format!("{err:?}").replace("\n     ", " "),
+      error.to_owned().replace("\n    ", " ")
+    );
   }
 
   test!(
     fn op_state_and_number(opstate: &mut OpState, a: u32) -> ();
-    (Ref(Mut, OpState), Numeric(u32)) -> Infallible(Void)
+    (Ref(Mut, OpState), Numeric(u32, None)) -> Infallible(Void)
   );
   test!(
     fn op_slices(#[buffer] r#in: &[u8], #[buffer] out: &mut [u8]);
@@ -1410,19 +1545,27 @@ mod tests {
   );
   test!(
     fn op_resource(#[smi] rid: ResourceId, #[buffer] buffer: &[u8]);
-    (Numeric(__SMI__), Buffer(Slice(Ref, u8))) ->  Infallible(Void)
+    (Numeric(__SMI__, None), Buffer(Slice(Ref, u8))) ->  Infallible(Void)
   );
   test!(
     #[smi] fn op_resource2(#[smi] rid: ResourceId) -> Result<ResourceId, Error>;
-    (Numeric(__SMI__)) -> Result(Numeric(__SMI__))
+    (Numeric(__SMI__, None)) -> Result(Numeric(__SMI__, None))
   );
   test!(
     fn op_option_numeric_result(state: &mut OpState) -> Result<Option<u32>, AnyError>;
-    (Ref(Mut, OpState)) -> Result(OptionNumeric(u32))
+    (Ref(Mut, OpState)) -> Result(OptionNumeric(u32, None))
+  );
+  test!(
+    #[smi] fn op_option_numeric_smi_result(#[smi] a: Option<u32>) -> Result<Option<u32>, AnyError>;
+    (OptionNumeric(__SMI__, None)) -> Result(OptionNumeric(__SMI__, None))
   );
   test!(
     fn op_ffi_read_f64(state: &mut OpState, ptr: *mut c_void, #[bigint] offset: isize) -> Result <f64, AnyError>;
-    (Ref(Mut, OpState), External(Ptr(Mut)), Numeric(isize)) -> Result(Numeric(f64))
+    (Ref(Mut, OpState), External(Ptr(Mut)), Numeric(isize, None)) -> Result(Numeric(f64, None))
+  );
+  test!(
+    #[number] fn op_64_bit_number(#[number] offset: isize) -> Result <u64, AnyError>;
+    (Numeric(isize, Number)) -> Result(Numeric(u64, Number))
   );
   test!(
     fn op_ptr_out(ptr: *const c_void) -> *mut c_void;
@@ -1430,7 +1573,7 @@ mod tests {
   );
   test!(
     fn op_print(#[string] msg: &str, is_err: bool) -> Result<(), Error>;
-    (String(RefStr), Numeric(bool)) -> Result(Void)
+    (String(RefStr), Numeric(bool, None)) -> Result(Void)
   );
   test!(
     #[string] fn op_lots_of_strings(#[string] s: String, #[string] s2: Option<String>, #[string] s3: Cow<str>, #[string(onebyte)] s4: Cow<[u8]>) -> String;
@@ -1473,8 +1616,8 @@ mod tests {
     (State(Ref, Something), OptionState(Ref, Something)) -> Infallible(Void)
   );
   test!(
-    #[buffer] fn op_buffers(#[buffer(copy)] a: Vec<u8>, #[buffer(copy)] b: Box<[u8]>, #[buffer(copy)] c: bytes::Bytes, #[buffer] d: V8Slice, #[buffer] e: JsBuffer, #[buffer(detach)] f: JsBuffer) -> Vec<u8>;
-    (Buffer(Vec(u8)), Buffer(BoxSlice(u8)), Buffer(Bytes(Copy)), Buffer(V8Slice(Default)), Buffer(JsBuffer(Default)), Buffer(JsBuffer(Detach))) -> Infallible(Buffer(Vec(u8)))
+    #[buffer] fn op_buffers(#[buffer(copy)] a: Vec<u8>, #[buffer(copy)] b: Box<[u8]>, #[buffer(copy)] c: bytes::Bytes, #[buffer] d: V8Slice<u8>, #[buffer] e: JsBuffer, #[buffer(detach)] f: JsBuffer) -> Vec<u8>;
+    (Buffer(Vec(u8)), Buffer(BoxSlice(u8)), Buffer(Bytes(Copy)), Buffer(V8Slice(Default, u8)), Buffer(JsBuffer(Default)), Buffer(JsBuffer(Detach))) -> Infallible(Buffer(Vec(u8)))
   );
   test!(
     #[buffer] fn op_return_bytesmut() -> bytes::BytesMut;
@@ -1495,6 +1638,18 @@ mod tests {
   test!(
     fn op_async_result_impl_void() -> Result<impl Future<Output = ()>, Error>;
     () -> ResultFuture(Void)
+  );
+  test!(
+    fn op_js_runtime_state_ref(state: &JsRuntimeState);
+    (Ref(Ref, JsRuntimeState)) -> Infallible(Void)
+  );
+  test!(
+    fn op_js_runtime_state_mut(state: &mut JsRuntimeState);
+    (Ref(Mut, JsRuntimeState)) -> Infallible(Void)
+  );
+  test!(
+    fn op_js_runtime_state_rc(state: Rc<RefCell<JsRuntimeState>>);
+    (RcRefCell(JsRuntimeState)) -> Infallible(Void)
   );
   // Args
 
@@ -1543,6 +1698,27 @@ mod tests {
     op_with_invalid_global,
     ArgError("l", InvalidAttributeType("global", "v8::Local<v8::String>")),
     fn f(#[global] l: v8::Local<v8::String>) {}
+  );
+  expect_fail!(
+    op_duplicate_js_runtime_state,
+    InvalidMultipleJsRuntimeState,
+    fn f(s1: &JsRuntimeState, s2: &mut JsRuntimeState) {}
+  );
+  expect_fail!(
+    op_extra_deno_core_v8,
+    ArgError(
+      "a",
+      InvalidDenoCorePrefix("deno_core::v8::Function", "v8", "v8::Function")
+    ),
+    fn f(a: &deno_core::v8::Function) {}
+  );
+  expect_fail!(
+    op_extra_deno_core_opstate,
+    ArgError(
+      "a",
+      InvalidDenoCorePrefix("deno_core::OpState", "OpState", "OpState")
+    ),
+    fn f(a: &deno_core::OpState) {}
   );
 
   // Generics
